@@ -20,6 +20,7 @@ from tqdm import tqdm
 from transformers import BertConfig, BertForSequenceClassification, AutoModel, AutoTokenizer, Trainer
 from transformers.models.bert.configuration_bert import BertConfig
 from peft import LoraConfig, get_peft_model, get_peft_model_state_dict
+import time
 
 @dataclass
 class ModelArguments:
@@ -148,8 +149,13 @@ def compute_metrics(eval_pred):
 
 def train():
     """Train the model."""
+
+    # parse arguments: TrainingArguments inherits from the HF class and adds some custom arguments for our use case
     parser = transformers.HfArgumentParser((ModelArguments, DataArguments, TrainingArguments))
     model_args, data_args, training_args = parser.parse_args_into_dataclasses()
+
+    # model class definition is pulled from repo through trust_remote_code=True, AutoModelForSequenceClassification adds a regression head on top of the base model
+    # MSE loss is used by default for regression tasks in Hugging Face Transformers when num_labels=1
     config = BertConfig.from_pretrained(model_args.model_name_or_path, num_labels=1,)
     model = transformers.AutoModelForSequenceClassification.from_pretrained(
         model_args.model_name_or_path,
@@ -171,6 +177,7 @@ def train():
         model = get_peft_model(model, lora_config)
         model.print_trainable_parameters()
 
+    # tokenizer loaded from base model, model_max_length is explicitely specified, default is 1024 here (truncation)
     tokenizer = transformers.AutoTokenizer.from_pretrained(
         model_args.model_name_or_path,
         cache_dir=training_args.cache_dir,
@@ -180,12 +187,15 @@ def train():
         trust_remote_code=True,
     )
 
+    # datasets are loaded and tokenized according to naming convention (train.csv, dev.csv, test.csv)
     train_dataset = SupervisedDataset(tokenizer=tokenizer, data_path=os.path.join(data_args.data_path, "train.csv"))
     val_dataset = SupervisedDataset(tokenizer=tokenizer, data_path=os.path.join(data_args.data_path, "dev.csv"))
     test_dataset = SupervisedDataset(tokenizer=tokenizer, data_path=os.path.join(data_args.data_path, "test.csv"))
 
+    # this takes care of padding the input sequences to the same length in a batch and creating attention masks
     data_collator = DataCollatorForSupervisedDataset(tokenizer=tokenizer)
 
+    # every certain number of steps, compute_metrics called on eval dataset 
     trainer = Trainer(
         model=model,
         tokenizer=tokenizer,
@@ -202,6 +212,7 @@ def train():
         trainer.save_state()
         safe_save_model_for_hf_trainer(trainer=trainer, output_dir=training_args.output_dir)
 
+    # this does a final test on the test set and saves the results in a json file in the output directory
     if training_args.eval_and_save_results:
         results_path = os.path.join(training_args.output_dir, "results", training_args.run_name)
         results = trainer.evaluate(eval_dataset=test_dataset)
@@ -210,4 +221,7 @@ def train():
             json.dump(results, f)
 
 if __name__ == "__main__":
+    start = time.perf_counter()
     train()
+    end = time.perf_counter()
+    print(f"Training completed in {end - start:.2f} seconds")
