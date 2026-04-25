@@ -209,6 +209,7 @@ def train():
 
     # datasets are loaded and tokenized according to naming convention (train.csv, dev.csv, test.csv)
     train_dataset = SupervisedDataset(tokenizer=tokenizer, data_path=os.path.join(data_args.data_path, "train.csv"))
+    print(f"num_labels in data: {train_dataset.num_labels}")
     val_dataset = SupervisedDataset(tokenizer=tokenizer, data_path=os.path.join(data_args.data_path, "dev.csv"))
     test_dataset = SupervisedDataset(tokenizer=tokenizer, data_path=os.path.join(data_args.data_path, "test.csv"))
 
