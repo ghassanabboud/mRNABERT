@@ -5,7 +5,7 @@ import logging
 import pickle
 from dataclasses import dataclass, field
 from typing import Optional, Dict, Sequence
-
+import wandb
 import numpy as np
 import pandas as pd
 import sklearn
@@ -21,6 +21,7 @@ from transformers import BertConfig, BertForSequenceClassification, AutoModel, A
 from transformers.models.bert.configuration_bert import BertConfig
 from peft import LoraConfig, get_peft_model, get_peft_model_state_dict
 import time
+import dataclasses
 
 @dataclass
 class ModelArguments:
@@ -44,29 +45,31 @@ class TrainingArguments(transformers.TrainingArguments):
     optim: str = field(default="adamw_torch")
     model_max_length: int = field(default=1024, metadata={"help": "Maximum sequence length."})
     gradient_accumulation_steps: int = field(default=2)
-    per_device_train_batch_size: int = field(default=8)
+    per_device_train_batch_size: int = field(default=16)
     per_device_eval_batch_size: int = field(default=32)
     fp16: bool = field(default=False)
-    logging_steps: int = field(default=100)
-    save_steps: int = field(default=100)
-    eval_steps: int = field(default=100)
+    logging_steps: int = field(default=5)
+    save_steps: int = field(default=35)
+    eval_steps: int = field(default=35)
     evaluation_strategy: str = field(default="steps")
-    warmup_steps: int = field(default=50)
+    warmup_steps: int = field(default=35)
     weight_decay: float = field(default=0.01)
     learning_rate: float = field(default=0.0001)
     lr_scheduler_type: str = field(default="cosine_with_restarts")
     save_total_limit: int = field(default=3)
     load_best_model_at_end: bool = field(default=True)
-    metric_for_best_model: str = field(default="pearson_corr_mean")
+    metric_for_best_model: str = field(default="r2_score_mean")
     greater_is_better: bool = field(default=True)
     output_dir: str = field(default="output_gena")
     find_unused_parameters: bool = field(default=False)
     checkpointing: bool = field(default=False)
     dataloader_pin_memory: bool = field(default=False)
-    eval_and_save_results: bool = field(default=False)
     save_model: bool = field(default=True)
     seed: int = field(default=42)
     report_to: Optional[str] = field(default='none')
+    overwrite_output_dir: bool = field(default=True)
+    log_level: str = field(default="info")
+    eval_and_save_results: bool = field(default=True)
 
 def safe_save_model_for_hf_trainer(trainer: transformers.Trainer, output_dir: str):
     """Collects the state dict and dump to disk."""
@@ -83,7 +86,9 @@ class SupervisedDataset(Dataset):
         super(SupervisedDataset, self).__init__()
 
         with open(data_path, "r") as f:
-            data = list(csv.reader(f))[1:]
+            reader = csv.reader(f)
+            header = next(reader)
+            data = list(reader)
         data = [row for row in data if all(v != '' for v in row[1:])]
         texts = [row[0] for row in data]
         labels = [[float(v) for v in row[1:]] for row in data]
@@ -100,6 +105,7 @@ class SupervisedDataset(Dataset):
         self.attention_mask = output["attention_mask"]
         self.labels = labels
         self.num_labels = len(labels[0]) if labels else 0
+        self.label_names = header[1:]
 
     def __len__(self):
         return len(self.input_ids)
@@ -123,7 +129,7 @@ class DataCollatorForSupervisedDataset:
             attention_mask=input_ids.ne(self.tokenizer.pad_token_id),
         )
 
-def calculate_metric_for_regression(logits: np.ndarray, labels: np.ndarray):
+def calculate_metric_for_regression(logits: np.ndarray, labels: np.ndarray, label_names=None):
     """Calculate per-label and mean metrics for single- or multi-label regression."""
     if logits.ndim == 3:
         logits = logits.reshape(-1, logits.shape[-1])
@@ -139,29 +145,23 @@ def calculate_metric_for_regression(logits: np.ndarray, labels: np.ndarray):
     n_labels = predictions.shape[1]
     metrics = {}
 
+    per_label = {"mse": [], "pearson": [], "spearman": [], "r2": []}
     for i in range(n_labels):
         preds_i = predictions[:, i]
         labels_i = labels[:, i]
         pearson_i, _ = pearsonr(labels_i, preds_i)
         spearman_i, _ = spearmanr(labels_i, preds_i)
-        metrics[f"mse_loss_label_{i}"] = mean_squared_error(labels_i, preds_i)
-        metrics[f"pearson_corr_label_{i}"] = pearson_i
-        metrics[f"spearman_corr_label_{i}"] = spearman_i
-        metrics[f"r2_score_label_{i}"] = r2_score(labels_i, preds_i)
+        per_label["mse"].append(mean_squared_error(labels_i, preds_i))
+        per_label["pearson"].append(pearson_i)
+        per_label["spearman"].append(spearman_i)
+        per_label["r2"].append(r2_score(labels_i, preds_i))
 
-    metrics["mse_loss_mean"] = np.mean([metrics[f"mse_loss_label_{i}"] for i in range(n_labels)])
-    metrics["pearson_corr_mean"] = np.mean([metrics[f"pearson_corr_label_{i}"] for i in range(n_labels)])
-    metrics["spearman_corr_mean"] = np.mean([metrics[f"spearman_corr_label_{i}"] for i in range(n_labels)])
-    metrics["r2_score_mean"] = np.mean([metrics[f"r2_score_label_{i}"] for i in range(n_labels)])
+    metrics["mse_loss_mean"] = np.mean(per_label["mse"])
+    metrics["pearson_corr_mean"] = np.mean(per_label["pearson"])
+    metrics["spearman_corr_mean"] = np.mean(per_label["spearman"])
+    metrics["r2_score_mean"] = np.mean(per_label["r2"])
 
     return metrics
-
-def compute_metrics(eval_pred):
-    """Compute metrics for evaluation."""
-    logits, labels = eval_pred
-    if isinstance(logits, tuple):  # Unpack logits if it's a tuple
-        logits = logits[0]
-    return calculate_metric_for_regression(logits, labels)
 
 def train():
     """Train the model."""
@@ -169,6 +169,14 @@ def train():
     # parse arguments: TrainingArguments inherits from the HF class and adds some custom arguments for our use case
     parser = transformers.HfArgumentParser((ModelArguments, DataArguments, TrainingArguments))
     model_args, data_args, training_args = parser.parse_args_into_dataclasses()
+
+    # wandb sweep passes all parameters as CLI args via ${args}, so no manual override needed.
+    # Use WANDB_RUN_ID (set by the sweep agent before launch) to isolate each run's checkpoints.
+    run_id = os.environ.get("WANDB_RUN_ID")
+    if run_id:
+        run_name = f"run_{run_id}"
+        training_args = dataclasses.replace(training_args, output_dir=os.path.join(training_args.output_dir, run_name), run_name=run_name)
+    print(f"Output dir: {training_args.output_dir}")
 
     # model class definition is pulled from repo through trust_remote_code=True, AutoModelForSequenceClassification adds a regression head on top of the base model
     # MSE loss is used by default for regression tasks in Hugging Face Transformers when num_labels=1
@@ -216,7 +224,15 @@ def train():
     # this takes care of padding the input sequences to the same length in a batch and creating attention masks
     data_collator = DataCollatorForSupervisedDataset(tokenizer=tokenizer)
 
-    # every certain number of steps, compute_metrics called on eval dataset 
+    label_names = train_dataset.label_names
+
+    def compute_metrics(eval_pred):
+        logits, labels = eval_pred
+        if isinstance(logits, tuple):
+            logits = logits[0]
+        return calculate_metric_for_regression(logits, labels, label_names=label_names)
+
+    # every certain number of steps, compute_metrics called on eval dataset
     trainer = Trainer(
         model=model,
         tokenizer=tokenizer,
@@ -238,7 +254,7 @@ def train():
         results_path = os.path.join(training_args.output_dir, "results", training_args.run_name)
         results = trainer.evaluate(eval_dataset=test_dataset)
         os.makedirs(results_path, exist_ok=True)
-        with open(os.path.join(results_path, "eval_results.json"), "w") as f:
+        with open(os.path.join(results_path, "test_results.json"), "w") as f:
             json.dump(results, f)
 
 if __name__ == "__main__":
