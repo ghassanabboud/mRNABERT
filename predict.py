@@ -82,22 +82,23 @@ def main():
     all_logits = np.concatenate(all_logits, axis=0)   # (N, num_labels)
     all_labels = np.concatenate(all_labels, axis=0)   # (N, num_labels)
 
-    metrics = calculate_metric_for_regression(all_logits, all_labels)
+    label_names = test_dataset.label_names
+    metrics = calculate_metric_for_regression(all_logits, all_labels, label_names=label_names)
     print("\nMetrics:")
     for k, v in metrics.items():
         print(f"  {k}: {v:.4f}")
 
     os.makedirs(args.output_dir, exist_ok=True)
-    
-    with open(os.path.join(args.output_dir, "metrics.json"), "w") as f:
+
+    with open(os.path.join(args.output_dir, "metrics_test_set.json"), "w") as f:
         json.dump({k: float(v) for k, v in metrics.items()}, f, indent=2)
 
-
     n_labels = all_logits.shape[1] if all_logits.ndim == 2 else 1
-    pred_cols = {f"pred_label_{i}": all_logits[:, i] for i in range(n_labels)}
-    true_cols = {f"true_label_{i}": all_labels[:, i] for i in range(n_labels)}
+    names = label_names if len(label_names) == n_labels else [str(i) for i in range(n_labels)]
+    pred_cols = {f"predicted_{n}": all_logits[:, i] for i, n in enumerate(names)}
+    true_cols = {f"{n}": all_labels[:, i] for i, n in enumerate(names)}
     df = pd.DataFrame({**pred_cols, **true_cols})
-    df.to_csv(os.path.join(args.output_dir, "predictions.csv"), index=False)
+    df.to_csv(os.path.join(args.output_dir, "predictions_test_set.csv"), index=False)
 
     print(f"\nSaved predictions to {args.output_dir}/predictions.csv")
     print(f"Saved metrics    to {args.output_dir}/metrics.json")
